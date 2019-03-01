@@ -70,7 +70,7 @@ jobs:
         # Run systems tests
         - examples/k8s/test-all.sh
         # Publish images
-        - eval $(minikube docker-env) && .travis/publish-images.sh
+        # - eval $(minikube docker-env) && .travis/publish-images.sh
 
 notifications:
     slack:
