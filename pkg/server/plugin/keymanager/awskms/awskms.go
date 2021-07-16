@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/kms/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/gofrs/uuid"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl"
@@ -60,8 +61,9 @@ type keyEntry struct {
 }
 
 type pluginHooks struct {
-	newClient func(ctx context.Context, config *Config) (kmsClient, error)
-	clk       clock.Clock
+	newKMSClient func(aws.Config) (kmsClient, error)
+	newSTSClient func(aws.Config) (stsClient, error)
+	clk          clock.Clock
 	// just for testing
 	scheduleDeleteSignal chan error
 	refreshAliasesSignal chan error
@@ -74,36 +76,42 @@ type Plugin struct {
 	keymanagerv1.UnsafeKeyManagerServer
 	configv1.UnsafeConfigServer
 
-	log            hclog.Logger
-	mu             sync.RWMutex
-	entries        map[string]keyEntry
-	kmsClient      kmsClient
-	trustDomain    string
-	serverID       string
-	scheduleDelete chan string
-	cancelTasks    context.CancelFunc
-	hooks          pluginHooks
+	log                hclog.Logger
+	mu                 sync.RWMutex
+	entries            map[string]keyEntry
+	kmsClient          kmsClient
+	stsClient          stsClient
+	trustDomain        string
+	serverID           string
+	useRoleBasedPolicy bool
+	scheduleDelete     chan string
+	cancelTasks        context.CancelFunc
+	hooks              pluginHooks
 }
 
 // Config provides configuration context for the plugin
 type Config struct {
-	AccessKeyID     string `hcl:"access_key_id" json:"access_key_id"`
-	SecretAccessKey string `hcl:"secret_access_key" json:"secret_access_key"`
-	Region          string `hcl:"region" json:"region"`
-	KeyMetadataFile string `hcl:"key_metadata_file" json:"key_metadata_file"`
+	AccessKeyID        string `hcl:"access_key_id" json:"access_key_id"`
+	SecretAccessKey    string `hcl:"secret_access_key" json:"secret_access_key"`
+	Region             string `hcl:"region" json:"region"`
+	KeyMetadataFile    string `hcl:"key_metadata_file" json:"key_metadata_file"`
+	UseRoleBasedPolicy bool   `hcl:"use_role_based_policy" json:"use_role_based_policy"`
 }
 
 // New returns an instantiated plugin
 func New() *Plugin {
-	return newPlugin(newKMSClient)
+	return newPlugin(newKMSClient, newSTSClient)
 }
 
-func newPlugin(newClient func(ctx context.Context, config *Config) (kmsClient, error)) *Plugin {
+func newPlugin(
+	newKMSClient func(aws.Config) (kmsClient, error),
+	newSTSClient func(aws.Config) (stsClient, error)) *Plugin {
 	return &Plugin{
 		entries: make(map[string]keyEntry),
 		hooks: pluginHooks{
-			newClient: newClient,
-			clk:       clock.New(),
+			newKMSClient: newKMSClient,
+			newSTSClient: newSTSClient,
+			clk:          clock.New(),
 		},
 		scheduleDelete: make(chan string, 120),
 	}
@@ -127,7 +135,17 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 	}
 	p.log.Debug("Loaded server id", "server_id", serverID)
 
-	kc, err := p.hooks.newClient(ctx, config)
+	awsCfg, err := newAWSConfig(ctx, config)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to create client configuration: %v", err)
+	}
+
+	sc, err := p.hooks.newSTSClient(awsCfg)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to create STS client: %v", err)
+	}
+
+	kc, err := p.hooks.newKMSClient(awsCfg)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to create KMS client: %v", err)
 	}
@@ -149,8 +167,10 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 
 	p.setCache(keyEntries)
 	p.kmsClient = kc
+	p.stsClient = sc
 	p.trustDomain = req.CoreConfiguration.TrustDomain
 	p.serverID = serverID
+	p.useRoleBasedPolicy = config.UseRoleBasedPolicy
 
 	// cancels previous tasks in case of re configure
 	if p.cancelTasks != nil {
@@ -273,10 +293,20 @@ func (p *Plugin) createKey(ctx context.Context, spireKeyID string, keyType keyma
 		return nil, status.Errorf(codes.Internal, "unsupported key type: %v", keyType)
 	}
 
+	var err error
+	var policy *string
+	if p.useRoleBasedPolicy {
+		policy, err = p.createRoleBasedPolicy(ctx)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "unable to create role based key policy: %v", err)
+		}
+	}
+
 	createKeyInput := &kms.CreateKeyInput{
 		Description:           aws.String(description),
 		KeyUsage:              types.KeyUsageTypeSignVerify,
 		CustomerMasterKeySpec: keySpec,
+		Policy:                policy,
 	}
 
 	key, err := p.kmsClient.CreateKey(ctx, createKeyInput)
@@ -705,6 +735,60 @@ func (p *Plugin) notifyDisposeKeys(err error) {
 	if p.hooks.disposeKeysSignal != nil {
 		p.hooks.disposeKeysSignal <- err
 	}
+}
+
+func (p *Plugin) createRoleBasedPolicy(ctx context.Context) (*string, error) {
+	result, err := p.stsClient.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+	if err != nil {
+		return nil, fmt.Errorf("cannot get caller identity: %w", err)
+	}
+
+	accountID := *result.Account
+	roleName, err := roleNameFromARN(*result.Arn)
+	if err != nil {
+		return nil, fmt.Errorf("cannot get role name from arn: %w", err)
+	}
+
+	policy := fmt.Sprintf(`
+{
+	"Version": "2012-10-17",
+	"Statement": [
+		{
+			"Sid": "Allow full access to role",
+			"Effect": "Allow",
+			"Principal": {
+				"AWS": "arn:aws:iam::%s:role/%s"
+			},
+			"Action": "kms:*",
+			"Resource": "*"
+		}
+	]
+}`,
+		accountID, roleName)
+
+	return &policy, nil
+}
+
+// roleNameFromARN returns the role name included in an ARN. If no role name exist
+// an error is returned.
+// ARN example: "arn:aws:sts::123456789:assumed-role/the-role-name/i-0001f4f25acfd1234",
+func roleNameFromARN(arn string) (string, error) {
+	arnSegments := strings.Split(arn, ":")
+	lastSegment := arnSegments[len(arnSegments)-1]
+
+	resource := strings.Split(lastSegment, "/")
+	if len(resource) < 2 {
+		return "", fmt.Errorf("incomplete resource, expected 'resource-type/resource-id' but got %q", lastSegment)
+	}
+
+	resourceType := resource[0]
+	if resourceType != "assumed-role" {
+		return "", fmt.Errorf("arn does not contain an assumed role: %q", arn)
+	}
+
+	roleName := resource[1]
+
+	return roleName, nil
 }
 
 func sanitizeTrustDomain(trustDomain string) string {

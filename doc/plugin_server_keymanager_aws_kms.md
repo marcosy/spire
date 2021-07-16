@@ -6,12 +6,13 @@ The `aws_kms` key manager plugin leverages the AWS Key Management Service (KMS) 
 
 The plugin accepts the following configuration options:
 
-| Key                 | Type   | Required                              | Description                                             | Default                                              |
-| ------------------- | ------ | ------------------------------------- | ------------------------------------------------------- | ---------------------------------------------------- |
-| access_key_id       | string | see [AWS KMS Access](#aws-kms-access) | The Access Key Id used to authenticate to KMS           | Value of the AWS_ACCESS_KEY_ID environment variable      |
-| secret_access_key   | string | see [AWS KMS Access](#aws-kms-access) | The Secret Access Key used to authenticate to KMS       | Value of the AWS_SECRET_ACCESS_KEY environment variable  |
-| region              | string | yes                                   | The region where the keys will be stored                |                                                      |
-| key_metadata_file   | string | yes                                   | A file path location where information about generated keys will be persisted |                                |
+| Key                   | Type   | Required                              | Description                                             | Default                                                     |
+| -------------------   | ------ | ------------------------------------- | ------------------------------------------------------- | ----------------------------------------------------        |
+| access_key_id         | string | see [AWS KMS Access](#aws-kms-access) | The Access Key Id used to authenticate to KMS           | Value of the AWS_ACCESS_KEY_ID environment variable         |
+| secret_access_key     | string | see [AWS KMS Access](#aws-kms-access) | The Secret Access Key used to authenticate to KMS       | Value of the AWS_SECRET_ACCESS_KEY environment variable     |
+| region                | string | yes                                   | The region where the keys will be stored                |                                                             |
+| key_metadata_file     | string | yes                                   | A file path location where information about generated keys will be persisted |                                       |
+| use_role_based_policy | bool   | no                                    | If true, CMKs are generated using a role-based policy    | false                                                      |
 
 ### Alias and Key Management
 
@@ -41,6 +42,63 @@ The IAM role must have an attached policy with the following permissions:
 - `kms:Sign`
 - `kms:UpdateAlias`
 - `kms:DeleteAlias`
+
+
+### Key policy
+By default, the plugin generates CMKs using the [default KMS key policy](https://docs.aws.amazon.com/kms/latest/developerguide/key-policies.html#key-policy-default):
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "Enable IAM User Permissions",
+            "Effect": "Allow",
+            "Principal": {
+                "AWS": "arn:aws:iam::111122223333:root"
+            },
+            "Action": "kms:*",
+            "Resource": "*"
+        }
+    ]
+}
+```
+
+The default policy gives the AWS account (root user) that owns the CMK full access to the CMK. 
+
+This:
+
++ Allows IAM policies to control access to the CMK.
++ Reduces the risk of the CMK becoming unmanageable.
+
+
+
+If `use_role_based_policy` is set, the plugin creates the key using the following policy:
+```json
+{
+	"Version": "2012-10-17",
+	"Statement": [
+		{
+			"Sid": "Allow full access to role",
+			"Effect": "Allow",
+			"Principal": {
+				"AWS": "arn:aws:iam::111122223333:role/example-assumed-role-name"
+			},
+			"Action": "kms:*",
+			"Resource": "*"
+		}
+	]
+}
+```
+
+The role-based policy gives the current SPIRE server assumed role full access to the CMK.
+
+This:
++ Reduces key access to the current assumed role only.
++ Does not allow IAM policies to control access to the CMK.
++ Increases the risk of the CMK becoming unmanageable since not even the root user will have access to it. **Do not delete the role, otherwise, the key will become unmanageable.**
+
+Keys created with the role-based policy will be cleaned up only by servers that assumed the same role.
 
 ## Sample Plugin Configuration
 

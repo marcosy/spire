@@ -43,19 +43,36 @@ const (
 )
 
 var (
-	ctx           = context.Background()
-	unixEpoch     = time.Unix(0, 0)
-	refreshedDate = unixEpoch.Add(6 * time.Hour)
+	ctx             = context.Background()
+	unixEpoch       = time.Unix(0, 0)
+	refreshedDate   = unixEpoch.Add(6 * time.Hour)
+	roleBasedPolicy = `
+{
+	"Version": "2012-10-17",
+	"Statement": [
+		{
+			"Sid": "Allow full access to role",
+			"Effect": "Allow",
+			"Principal": {
+				"AWS": "arn:aws:iam::example-account-id:role/example-assumed-role-name"
+			},
+			"Action": "kms:*",
+			"Resource": "*"
+		}
+	]
+}`
 )
 
 func TestKeyManagerContract(t *testing.T) {
 	create := func(t *testing.T) keymanager.KeyManager {
 		dir := spiretest.TempDir(t)
 		c := clock.NewMock()
-		fakeClient := newKMSClientFake(t, c)
-		p := newPlugin(func(ctx context.Context, c *Config) (kmsClient, error) {
-			return fakeClient, nil
-		})
+		fakeKMSClient := newKMSClientFake(t, c)
+		fakeSTSClient := newSTSClientFake(t)
+		p := newPlugin(
+			func(aws.Config) (kmsClient, error) { return fakeKMSClient, nil },
+			func(aws.Config) (stsClient, error) { return fakeSTSClient, nil },
+		)
 		km := new(keymanager.V1)
 		plugintest.Load(t, builtin(p), km, plugintest.Configuref(`
 			region = "fake-region"
@@ -76,10 +93,11 @@ func TestKeyManagerContract(t *testing.T) {
 }
 
 type pluginTest struct {
-	plugin     *Plugin
-	fakeClient *kmsClientFake
-	logHook    *test.Hook
-	clockHook  *clock.Mock
+	plugin        *Plugin
+	fakeKMSClient *kmsClientFake
+	fakeSTSClient *stsClientFake
+	logHook       *test.Hook
+	clockHook     *clock.Mock
 }
 
 func setupTest(t *testing.T) *pluginTest {
@@ -87,33 +105,37 @@ func setupTest(t *testing.T) *pluginTest {
 	log.Level = logrus.DebugLevel
 
 	c := clock.NewMock()
-	fakeClient := newKMSClientFake(t, c)
-	p := newPlugin(func(ctx context.Context, c *Config) (kmsClient, error) {
-		return fakeClient, nil
-	})
+	fakeKMSClient := newKMSClientFake(t, c)
+	fakeSTSClient := newSTSClientFake(t)
+	p := newPlugin(
+		func(aws.Config) (kmsClient, error) { return fakeKMSClient, nil },
+		func(aws.Config) (stsClient, error) { return fakeSTSClient, nil },
+	)
 	km := new(keymanager.V1)
 	plugintest.Load(t, builtin(p), km, plugintest.Log(log))
 
 	p.hooks.clk = c
 
 	return &pluginTest{
-		plugin:     p,
-		fakeClient: fakeClient,
-		logHook:    logHook,
-		clockHook:  c,
+		plugin:        p,
+		fakeKMSClient: fakeKMSClient,
+		fakeSTSClient: fakeSTSClient,
+		logHook:       logHook,
+		clockHook:     c,
 	}
 }
 
 func TestConfigure(t *testing.T) {
 	for _, tt := range []struct {
-		name             string
-		err              string
-		code             codes.Code
-		configureRequest *configv1.ConfigureRequest
-		fakeEntries      []fakeKeyEntry
-		listAliasesErr   string
-		describeKeyErr   string
-		getPublicKeyErr  string
+		name                    string
+		err                     string
+		code                    codes.Code
+		configureRequest        *configv1.ConfigureRequest
+		fakeEntries             []fakeKeyEntry
+		listAliasesErr          string
+		describeKeyErr          string
+		getPublicKeyErr         string
+		expectedRoleBasedPolicy bool
 	}{
 
 		{
@@ -170,27 +192,32 @@ func TestConfigure(t *testing.T) {
 		},
 		{
 			name:             "missing access key id",
-			configureRequest: configureRequestWithVars("", "secret_access_key", "region", getKeyMetadataFile(t)),
+			configureRequest: configureRequestWithVars("", "secret_access_key", "region", getKeyMetadataFile(t), "false"),
 		},
 		{
 			name:             "missing secret access key",
-			configureRequest: configureRequestWithVars("access_key", "", "region", getKeyMetadataFile(t)),
+			configureRequest: configureRequestWithVars("access_key", "", "region", getKeyMetadataFile(t), "false"),
 		},
 		{
 			name:             "missing region",
-			configureRequest: configureRequestWithVars("access_key_id", "secret_access_key", "", getKeyMetadataFile(t)),
+			configureRequest: configureRequestWithVars("access_key_id", "secret_access_key", "", getKeyMetadataFile(t), "false"),
 			err:              "configuration is missing a region",
 			code:             codes.InvalidArgument,
 		},
 		{
 			name:             "missing server id file path",
-			configureRequest: configureRequestWithVars("access_key_id", "secret_access_key", "region", ""),
+			configureRequest: configureRequestWithVars("access_key_id", "secret_access_key", "region", "", "false"),
 			err:              "configuration is missing server id file path",
 			code:             codes.InvalidArgument,
 		},
 		{
 			name:             "new server id file path",
-			configureRequest: configureRequestWithVars("access_key_id", "secret_access_key", "region", getEmptyKeyMetadataFile(t)),
+			configureRequest: configureRequestWithVars("access_key_id", "secret_access_key", "region", getEmptyKeyMetadataFile(t), "false"),
+		},
+		{
+			name:                    "use role based key policy",
+			configureRequest:        configureRequestWithVars("access_key_id", "secret_access_key", "region", getEmptyKeyMetadataFile(t), "true"),
+			expectedRoleBasedPolicy: true,
 		},
 		{
 			name:             "decode error",
@@ -273,10 +300,10 @@ func TestConfigure(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// setup
 			ts := setupTest(t)
-			ts.fakeClient.setEntries(tt.fakeEntries)
-			ts.fakeClient.setListAliasesErr(tt.listAliasesErr)
-			ts.fakeClient.setDescribeKeyErr(tt.describeKeyErr)
-			ts.fakeClient.setgetPublicKeyErr(tt.getPublicKeyErr)
+			ts.fakeKMSClient.setEntries(tt.fakeEntries)
+			ts.fakeKMSClient.setListAliasesErr(tt.listAliasesErr)
+			ts.fakeKMSClient.setDescribeKeyErr(tt.describeKeyErr)
+			ts.fakeKMSClient.setgetPublicKeyErr(tt.getPublicKeyErr)
 
 			// exercise
 			_, err := ts.plugin.Configure(ctx, tt.configureRequest)
@@ -287,6 +314,7 @@ func TestConfigure(t *testing.T) {
 			}
 
 			require.NoError(t, err)
+			require.Equal(t, tt.expectedRoleBasedPolicy, ts.plugin.useRoleBasedPolicy)
 		})
 	}
 }
@@ -305,6 +333,11 @@ func TestGenerateKey(t *testing.T) {
 		scheduleKeyDeletionErr error
 		createAliasErr         string
 		updateAliasErr         string
+		getCallerIdentityErr   string
+		instanceAccountID      string
+		instanceRoleARN        string
+		expectedKeyPolicy      *string
+		configureReq           *configv1.ConfigureRequest
 	}{
 		{
 			name: "success: non existing key",
@@ -319,6 +352,17 @@ func TestGenerateKey(t *testing.T) {
 				KeyId:   "bundle-acme-foo.bar+rsa",
 				KeyType: keymanagerv1.KeyType_EC_P256,
 			},
+		},
+		{
+			name: "success: non existing key with role based policy",
+			request: &keymanagerv1.GenerateKeyRequest{
+				KeyId:   spireKeyID,
+				KeyType: keymanagerv1.KeyType_EC_P256,
+			},
+			configureReq:      configureRequestWithVars("access_key_id", "secret_access_key", "region", getEmptyKeyMetadataFile(t), "true"),
+			instanceAccountID: "example-account-id",
+			instanceRoleARN:   "arn:aws:sts::example-account-id:assumed-role/example-assumed-role-name/example-instance-id",
+			expectedKeyPolicy: &roleBasedPolicy,
 		},
 		{
 			name: "success: replace old key",
@@ -518,7 +562,6 @@ func TestGenerateKey(t *testing.T) {
 				},
 			},
 		},
-
 		{
 			name: "invalid key state error",
 			request: &keymanagerv1.GenerateKeyRequest{
@@ -547,7 +590,6 @@ func TestGenerateKey(t *testing.T) {
 				},
 			},
 		},
-
 		{
 			name:                   "schedule key deletion error",
 			scheduleKeyDeletionErr: errors.New("schedule key deletion error"),
@@ -583,23 +625,64 @@ func TestGenerateKey(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "fail to get caller identity",
+			request: &keymanagerv1.GenerateKeyRequest{
+				KeyId:   spireKeyID,
+				KeyType: keymanagerv1.KeyType_EC_P256,
+			},
+			configureReq:         configureRequestWithVars("access_key_id", "secret_access_key", "region", getEmptyKeyMetadataFile(t), "true"),
+			getCallerIdentityErr: "something went wrong",
+			err:                  "cannot get caller identity: something went wrong",
+			code:                 codes.Internal,
+		},
+		{
+			name: "incomplete ARN",
+			request: &keymanagerv1.GenerateKeyRequest{
+				KeyId:   spireKeyID,
+				KeyType: keymanagerv1.KeyType_EC_P256,
+			},
+			configureReq:    configureRequestWithVars("access_key_id", "secret_access_key", "region", getEmptyKeyMetadataFile(t), "true"),
+			instanceRoleARN: "arn:aws:sts::example-account-id",
+			err:             "unable to create role based key policy: cannot get role name from arn: incomplete resource, expected 'resource-type/resource-id' but got \"example-account-id\"",
+			code:            codes.Internal,
+		},
+		{
+			name: "missing role in ARN",
+			request: &keymanagerv1.GenerateKeyRequest{
+				KeyId:   spireKeyID,
+				KeyType: keymanagerv1.KeyType_EC_P256,
+			},
+			configureReq:    configureRequestWithVars("access_key_id", "secret_access_key", "region", getEmptyKeyMetadataFile(t), "true"),
+			instanceRoleARN: "arn:aws:sts::example-account-id:user/development",
+			err:             "unable to create role based key policy: cannot get role name from arn: arn does not contain an assumed role",
+			code:            codes.Internal,
+		},
 	} {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			// setup
 			ts := setupTest(t)
-			ts.fakeClient.setEntries(tt.fakeEntries)
-			ts.fakeClient.setCreateKeyErr(tt.createKeyErr)
-			ts.fakeClient.setCreateAliasesErr(tt.createAliasErr)
-			ts.fakeClient.setUpdateAliasErr(tt.updateAliasErr)
-			ts.fakeClient.setScheduleKeyDeletionErr(tt.scheduleKeyDeletionErr)
+			ts.fakeKMSClient.setEntries(tt.fakeEntries)
+			ts.fakeKMSClient.setCreateKeyErr(tt.createKeyErr)
+			ts.fakeKMSClient.setCreateAliasesErr(tt.createAliasErr)
+			ts.fakeKMSClient.setUpdateAliasErr(tt.updateAliasErr)
+			ts.fakeKMSClient.setScheduleKeyDeletionErr(tt.scheduleKeyDeletionErr)
 			deleteSignal := make(chan error)
 			ts.plugin.hooks.scheduleDeleteSignal = deleteSignal
+			ts.fakeKMSClient.setExpectedKeyPolicy(tt.expectedKeyPolicy)
+			ts.fakeSTSClient.setGetCallerIdentityErr(tt.getCallerIdentityErr)
+			ts.fakeSTSClient.setGetCallerIdentityAccount(tt.instanceAccountID)
+			ts.fakeSTSClient.setGetCallerIdentityArn(tt.instanceRoleARN)
 
-			_, err := ts.plugin.Configure(ctx, configureRequestWithDefaults(t))
+			configureReq := tt.configureReq
+			if configureReq == nil {
+				configureReq = configureRequestWithDefaults(t)
+			}
+			_, err := ts.plugin.Configure(ctx, configureReq)
 			require.NoError(t, err)
 
-			ts.fakeClient.setgetPublicKeyErr(tt.getPublicKeyErr)
+			ts.fakeKMSClient.setgetPublicKeyErr(tt.getPublicKeyErr)
 
 			// exercise
 			resp, err := ts.plugin.GenerateKey(ctx, tt.request)
@@ -898,7 +981,7 @@ func TestSignData(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// setup
 			ts := setupTest(t)
-			ts.fakeClient.setSignDataErr(tt.signDataError)
+			ts.fakeKMSClient.setSignDataErr(tt.signDataError)
 			_, err := ts.plugin.Configure(ctx, configureRequestWithDefaults(t))
 			require.NoError(t, err)
 			if tt.generateKeyRequest != nil {
@@ -969,7 +1052,7 @@ func TestGetPublicKey(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// setup
 			ts := setupTest(t)
-			ts.fakeClient.setEntries(tt.fakeEntries)
+			ts.fakeKMSClient.setEntries(tt.fakeEntries)
 
 			_, err := ts.plugin.Configure(ctx, configureRequestWithDefaults(t))
 			require.NoError(t, err)
@@ -1015,7 +1098,7 @@ func TestGetPublicKeys(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// setup
 			ts := setupTest(t)
-			ts.fakeClient.setEntries(tt.fakeEntries)
+			ts.fakeKMSClient.setEntries(tt.fakeEntries)
 			_, err := ts.plugin.Configure(ctx, configureRequestWithDefaults(t))
 			require.NoError(t, err)
 
@@ -1187,8 +1270,8 @@ func TestRefreshAliases(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// setup
 			ts := setupTest(t)
-			ts.fakeClient.setEntries(tt.fakeEntries)
-			ts.fakeClient.setUpdateAliasErr(tt.updateAliasErr)
+			ts.fakeKMSClient.setEntries(tt.fakeEntries)
+			ts.fakeKMSClient.setUpdateAliasErr(tt.updateAliasErr)
 			refreshAliasesSignal := make(chan error)
 			ts.plugin.hooks.refreshAliasesSignal = refreshAliasesSignal
 
@@ -1211,9 +1294,9 @@ func TestRefreshAliases(t *testing.T) {
 			}
 
 			require.NoError(t, err)
-			storedAliases := ts.fakeClient.store.aliases
+			storedAliases := ts.fakeKMSClient.store.aliases
 			require.Len(t, storedAliases, 7)
-			storedKeys := ts.fakeClient.store.keyEntries
+			storedKeys := ts.fakeKMSClient.store.keyEntries
 			require.Len(t, storedKeys, len(tt.expectedEntries))
 			for _, expected := range tt.expectedEntries {
 				if expected.AliasName == nil {
@@ -1419,7 +1502,7 @@ func TestDisposeAliases(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// setup
 			ts := setupTest(t)
-			ts.fakeClient.setEntries(tt.fakeEntries)
+			ts.fakeKMSClient.setEntries(tt.fakeEntries)
 			// this is so dispose keys blocks on init and allows to test dispose aliases isolated
 			ts.plugin.hooks.disposeKeysSignal = make(chan error)
 			disposeAliasesSignal := make(chan error)
@@ -1431,9 +1514,9 @@ func TestDisposeAliases(t *testing.T) {
 			_, err := ts.plugin.Configure(ctx, tt.configureRequest)
 			require.NoError(t, err)
 
-			ts.fakeClient.setListAliasesErr(tt.listAliasesErr)
-			ts.fakeClient.setDescribeKeyErr(tt.describeKeyErr)
-			ts.fakeClient.setDeleteAliasErr(tt.deleteAliasErr)
+			ts.fakeKMSClient.setListAliasesErr(tt.listAliasesErr)
+			ts.fakeKMSClient.setDescribeKeyErr(tt.describeKeyErr)
+			ts.fakeKMSClient.setDeleteAliasErr(tt.deleteAliasErr)
 
 			// wait for dispose aliases task to be initialized
 			_ = waitForSignal(t, disposeAliasesSignal)
@@ -1454,9 +1537,9 @@ func TestDisposeAliases(t *testing.T) {
 			_ = waitForSignal(t, deleteSignal)
 			// assert end result
 			require.NoError(t, err)
-			storedAliases := ts.fakeClient.store.aliases
+			storedAliases := ts.fakeKMSClient.store.aliases
 			require.Len(t, storedAliases, 7)
-			storedKeys := ts.fakeClient.store.keyEntries
+			storedKeys := ts.fakeKMSClient.store.keyEntries
 			require.Len(t, storedKeys, 8)
 
 			for _, expected := range tt.expectedEntries {
@@ -1759,7 +1842,7 @@ func TestDisposeKeys(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// setup
 			ts := setupTest(t)
-			ts.fakeClient.setEntries(tt.fakeEntries)
+			ts.fakeKMSClient.setEntries(tt.fakeEntries)
 
 			// this is so dispose aliases blocks on init and allows to test dispose keys isolated
 			ts.plugin.hooks.disposeAliasesSignal = make(chan error)
@@ -1772,9 +1855,9 @@ func TestDisposeKeys(t *testing.T) {
 			_, err := ts.plugin.Configure(ctx, tt.configureRequest)
 			require.NoError(t, err)
 
-			ts.fakeClient.setListKeysErr(tt.listKeysErr)
-			ts.fakeClient.setDescribeKeyErr(tt.describeKeyErr)
-			ts.fakeClient.setListAliasesErr(tt.listAliasesErr)
+			ts.fakeKMSClient.setListKeysErr(tt.listKeysErr)
+			ts.fakeKMSClient.setDescribeKeyErr(tt.describeKeyErr)
+			ts.fakeKMSClient.setListAliasesErr(tt.listAliasesErr)
 
 			// wait for dispose keys task to be initialized
 			_ = waitForSignal(t, disposeKeysSignal)
@@ -1792,7 +1875,7 @@ func TestDisposeKeys(t *testing.T) {
 			_ = waitForSignal(t, deleteSignal)
 
 			// assert
-			storedKeys := ts.fakeClient.store.keyEntries
+			storedKeys := ts.fakeKMSClient.store.keyEntries
 			require.Len(t, storedKeys, len(tt.expectedEntries))
 			for _, expected := range tt.expectedEntries {
 				_, ok := storedKeys[*expected.KeyID]
@@ -1808,18 +1891,20 @@ func configureRequestWithString(config string) *configv1.ConfigureRequest {
 	}
 }
 
-func configureRequestWithVars(accessKeyID, secretAccessKey, region, keyMetadataFile string) *configv1.ConfigureRequest {
+func configureRequestWithVars(accessKeyID, secretAccessKey, region, keyMetadataFile, useRoleBasedPolicy string) *configv1.ConfigureRequest {
 	return &configv1.ConfigureRequest{
 		HclConfiguration: fmt.Sprintf(`{
 			"access_key_id": "%s",
 			"secret_access_key": "%s",
 			"region":"%s",
-			"key_metadata_file":"%s"
+			"key_metadata_file":"%s",
+			"use_role_based_policy":"%s"
 			}`,
 			accessKeyID,
 			secretAccessKey,
 			region,
-			keyMetadataFile),
+			keyMetadataFile,
+			useRoleBasedPolicy),
 		CoreConfiguration: &configv1.CoreConfiguration{TrustDomain: "test.example.org"},
 	}
 }
